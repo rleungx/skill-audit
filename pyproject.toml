@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+binary = ["pyinstaller>=6.0"]
+
 [project.scripts]
 skill-audit = "skill_audit.cli:main"
 
@@ -18,3 +21,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+skill_audit = ["assets/*.ts"]

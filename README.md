@@ -1,111 +1,79 @@
 # skill-audit
 
-skill-audit is an automated red-team auditor for Skill documents (e.g. `SKILL.md`). It generates adversarial cases, simulates an assistant following your Skill, and then judges whether the assistant violates the Skill constraints. The result is an HTML report with per-case scores, violation reasons, and fix suggestions.
+`skill-audit` evaluates whether a `SKILL.md` remains reliable under high-risk scenarios.
 
-## Features
+It generates test cases, simulates assistant responses, and writes an HTML report. Generated files go to the system temporary directory by default.
 
-- Supports multiple providers: Ollama (local), OpenAI, MiniMax (OpenAI-compatible `/chat/completions`).
-- Generates at least 5 adversarial cases, each with an `impact` level: `critical`, `high`, `medium`, `low`.
-- Produces an HTML report: `report_MMDD_HHMM.html`.
-- CI-friendly exit code via `--threshold`.
-
-## Quickstart
-
-### 1) Prerequisites
-
-- Python 3.10+
-- If using a local model: make sure Ollama is running and the model is available:
-
-```bash
-ollama run llama3:8b
-```
-
-### 2) Install (recommended)
+## 1. Install dependencies
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -U pip
-python3 -m pip install -e .
+python3 -m pip install -e '.[binary]'
 ```
 
-Now you can run:
+## 2. Build
 
 ```bash
-skill-audit --file SKILL.md --provider ollama --model llama3:8b
+./scripts/build-binary.sh
 ```
 
-### 3) Run without installing (repo script)
+Build output:
 
 ```bash
-./skill-audit --file SKILL.md --provider ollama --model llama3:8b
+./dist/skill-audit
 ```
 
-## Usage examples
-
-### Ollama (local)
+To write the binary to another directory:
 
 ```bash
-skill-audit --file SKILL.md --provider ollama --model llama3:8b
+./scripts/build-binary.sh ./release
 ```
 
-### OpenAI
+## 3. Usage
+
+Common commands:
 
 ```bash
+# Local Ollama
+ollama run gpt-oss
+./dist/skill-audit --file SKILL.md --model gpt-oss
+
+# OpenAI
 export OPENAI_API_KEY="your_key"
-skill-audit --file SKILL.md --provider openai --model gpt-4o
+./dist/skill-audit --file SKILL.md --provider openai --model gpt-5.4
+
+# Freeze a snapshot for repeated iteration
+./dist/skill-audit --file SKILL.md --model gpt-oss --freeze
+./dist/skill-audit --file SKILL.md --model gpt-oss --snapshot /path/to/snapshot.json
+
+# Custom report path
+./dist/skill-audit --file SKILL.md --model gpt-oss --report ./out/report.html
+
+# Custom pass threshold
+./dist/skill-audit --file SKILL.md --model gpt-oss --threshold 85
 ```
 
-### MiniMax
+Common options:
+
+- `--file`: `SKILL.md` to evaluate
+- `--provider`: `ollama` / `openai` / `anthropic` / `google` / `minimax`
+- `--model`: model name
+- `--freeze [PATH]`: generate and save a snapshot
+- `--snapshot PATH`: rerun against an existing snapshot
+- `--report PATH`: custom report output path
+- `--threshold N`: pass threshold, default `80`
+
+Other provider examples:
 
 ```bash
+export ANTHROPIC_API_KEY="your_key"
+./dist/skill-audit --file SKILL.md --provider anthropic --model claude-opus-4-6
+
+export GOOGLE_API_KEY="your_key"
+./dist/skill-audit --file SKILL.md --provider google --model gemini-3.1-pro-preview
+
 export MINIMAX_API_KEY="your_key"
-skill-audit --file SKILL.md --provider minimax --model MiniMax-M2.5
-```
-
-If you need a custom endpoint:
-
-```bash
-skill-audit --file SKILL.md --provider minimax --model MiniMax-M2.5 --url https://api.minimaxi.com/v1
-```
-
-## CLI flags
-
-| Flag | Required | Notes |
-| --- | --- | --- |
-| `--file` | Yes | Path to the `SKILL.md` to evaluate. |
-| `--provider` | No | `ollama` (default) / `openai` / `minimax`. |
-| `--model` | Yes | Model name, e.g. `llama3:8b` or `gpt-4o`. |
-| `--key` | OpenAI/MiniMax | Optional if you set `OPENAI_API_KEY` / `MINIMAX_API_KEY`. |
-| `--url` | No | Override API base URL. |
-| `--threshold` | No | Pass threshold (0-100), default 80. Exit 1 if below. |
-
-## Build a single-file executable (optional)
-
-If you want a standalone executable for distribution/CI:
-
-```bash
-python3 -m pip install -U pyinstaller
-pyinstaller -F -n skill-audit --paths src skill-audit
-./dist/skill-audit --file SKILL.md --provider ollama --model llama3:8b
-```
-
-## CI example (GitHub Actions)
-
-```yaml
-- name: Set up Python
-  uses: actions/setup-python@v5
-  with:
-    python-version: "3.10"
-
-- name: Install
-  run: |
-    python -m pip install -U pip
-    python -m pip install .
-
-- name: Run Skill Eval
-  env:
-    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  run: |
-    skill-audit --file SKILL.md --provider openai --model gpt-4o --threshold 85
+./dist/skill-audit --file SKILL.md --provider minimax --model MiniMax-M2.5
 ```

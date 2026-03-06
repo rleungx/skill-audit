@@ -44,7 +44,7 @@ jobs:
 
       - name: Build binary
         run: |
-          ./scripts/build-binary.sh
+          PYINSTALLER_CONFIG_DIR=./build/pyinstaller-config pyinstaller --noconfirm --clean skill-audit.spec --distpath ./dist --workpath ./build/pyinstaller
           ./dist/skill-audit --help
 
       - name: Run skill evaluation

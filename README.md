@@ -4,7 +4,25 @@
 
 It generates test cases, simulates assistant responses, and writes an HTML report. Generated files go to the system temporary directory by default.
 
-## 1. Install dependencies
+## Install
+
+Recommended:
+
+```bash
+pipx install git+https://github.com/rleungx/skill-audit.git
+skill-audit --help
+```
+
+If you prefer `pip`:
+
+```bash
+python3 -m pip install git+https://github.com/rleungx/skill-audit.git
+skill-audit --help
+```
+
+If you do not want Python on the target machine, download the matching prebuilt archive from GitHub Releases, extract it, and run `skill-audit`.
+
+## Local binary build prerequisites
 
 ```bash
 python3 -m venv .venv
@@ -13,10 +31,10 @@ python3 -m pip install -U pip
 python3 -m pip install -e '.[binary]'
 ```
 
-## 2. Build
+## Build
 
 ```bash
-./scripts/build-binary.sh
+PYINSTALLER_CONFIG_DIR=./build/pyinstaller-config pyinstaller --noconfirm --clean skill-audit.spec --distpath ./dist --workpath ./build/pyinstaller
 ```
 
 Build output:
@@ -28,10 +46,10 @@ Build output:
 To write the binary to another directory:
 
 ```bash
-./scripts/build-binary.sh ./release
+PYINSTALLER_CONFIG_DIR=./build/pyinstaller-config pyinstaller --noconfirm --clean skill-audit.spec --distpath ./release --workpath ./build/pyinstaller
 ```
 
-## 3. Usage
+## Usage
 
 Common commands:
 
@@ -78,7 +96,7 @@ export MINIMAX_API_KEY="your_key"
 ./dist/skill-audit --file SKILL.md --provider minimax --model MiniMax-M2.5
 ```
 
-## 4. Validate locally
+## Validate locally
 
 ```bash
 python -m unittest discover -s tests -t . -v
@@ -86,4 +104,4 @@ python -m py_compile src/skill_audit/cli.py
 node -c src/skill_audit/assets/report.ts
 ```
 
-CI runs the same checks, then builds `./dist/skill-audit`.
+CI builds release archives automatically for tagged versions (`v*`).

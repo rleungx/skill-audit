@@ -24,75 +24,95 @@ _DEFAULT_FROZEN_CASE_COUNT = 5
 _CHECKLIST_STATUSES: tuple[str, ...] = ("pass", "fail", "not_applicable")
 _DEFAULT_CHECKLIST_STATUS = "not_applicable"
 
+_IMPACT_ALIASES: dict[str, str] = {
+    "crit": "critical",
+    "critical": "critical",
+    "severe": "critical",
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+}
 
-def _normalize_impact(value: object) -> str:
+_RULE_LEVEL_ALIASES: dict[str, str] = {
+    "hard": "hard",
+    "critical": "hard",
+    "must": "hard",
+    "mandatory": "hard",
+    "required": "required",
+    "requirement": "required",
+    "default": "required",
+    "normal": "required",
+    "advisory": "advisory",
+    "advice": "advisory",
+    "recommended": "advisory",
+    "recommendation": "advisory",
+    "optional": "advisory",
+}
+
+_CHECKLIST_STATUS_ALIASES: dict[str, str] = {
+    "pass": "pass",
+    "passed": "pass",
+    "ok": "pass",
+    "yes": "pass",
+    "true": "pass",
+    "compliant": "pass",
+    "fail": "fail",
+    "failed": "fail",
+    "no": "fail",
+    "false": "fail",
+    "violation": "fail",
+    "violated": "fail",
+    "not_applicable": "not_applicable",
+    "not applicable": "not_applicable",
+    "n/a": "not_applicable",
+    "na": "not_applicable",
+    "skip": "not_applicable",
+    "skipped": "not_applicable",
+}
+
+_DEFAULT_CHECKLIST_NOTES = "No explicit checklist finding returned by the judge."
+
+
+def _normalize_enum(
+    value: object,
+    *,
+    aliases: dict[str, str],
+    allowed_values: tuple[str, ...],
+    default: str,
+) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
-        return _DEFAULT_IMPACT
+        return default
 
-    aliases: dict[str, str] = {
-        "crit": "critical",
-        "critical": "critical",
-        "severe": "critical",
-        "high": "high",
-        "medium": "medium",
-        "low": "low",
-    }
     normalized = aliases.get(raw, raw)
-    return normalized if normalized in _IMPACT_LEVELS else _DEFAULT_IMPACT
+    return normalized if normalized in allowed_values else default
+
+
+def _normalize_impact(value: object) -> str:
+    return _normalize_enum(
+        value,
+        aliases=_IMPACT_ALIASES,
+        allowed_values=_IMPACT_LEVELS,
+        default=_DEFAULT_IMPACT,
+    )
 
 
 def _normalize_rule_level(value: object) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return _DEFAULT_RULE_LEVEL
-
-    aliases: dict[str, str] = {
-        "hard": "hard",
-        "critical": "hard",
-        "must": "hard",
-        "mandatory": "hard",
-        "required": "required",
-        "requirement": "required",
-        "default": "required",
-        "normal": "required",
-        "advisory": "advisory",
-        "advice": "advisory",
-        "recommended": "advisory",
-        "recommendation": "advisory",
-        "optional": "advisory",
-    }
-    normalized = aliases.get(raw, raw)
-    return normalized if normalized in _RULE_LEVELS else _DEFAULT_RULE_LEVEL
+    return _normalize_enum(
+        value,
+        aliases=_RULE_LEVEL_ALIASES,
+        allowed_values=_RULE_LEVELS,
+        default=_DEFAULT_RULE_LEVEL,
+    )
 
 
 def _normalize_checklist_status(value: object) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return _DEFAULT_CHECKLIST_STATUS
-
-    aliases: dict[str, str] = {
-        "pass": "pass",
-        "passed": "pass",
-        "ok": "pass",
-        "yes": "pass",
-        "true": "pass",
-        "compliant": "pass",
-        "fail": "fail",
-        "failed": "fail",
-        "no": "fail",
-        "false": "fail",
-        "violation": "fail",
-        "violated": "fail",
-        "not_applicable": "not_applicable",
-        "not applicable": "not_applicable",
-        "n/a": "not_applicable",
-        "na": "not_applicable",
-        "skip": "not_applicable",
-        "skipped": "not_applicable",
-    }
-    normalized = aliases.get(raw, raw)
-    return normalized if normalized in _CHECKLIST_STATUSES else _DEFAULT_CHECKLIST_STATUS
+    return _normalize_enum(
+        value,
+        aliases=_CHECKLIST_STATUS_ALIASES,
+        allowed_values=_CHECKLIST_STATUSES,
+        default=_DEFAULT_CHECKLIST_STATUS,
+    )
 
 
 @dataclass(frozen=True)
@@ -228,6 +248,39 @@ def _dedupe_rubric_items(items: list[RubricItem]) -> list[RubricItem]:
     return sorted(out, key=lambda item: item.rule.lower())
 
 
+def _parse_attack_case_items(data: object) -> list[AttackCase]:
+    raw_cases = data if isinstance(data, list) else []
+    parsed: list[AttackCase] = []
+    for item in raw_cases:
+        if not isinstance(item, dict):
+            continue
+        scenario = str(item.get("scenario", "")).strip()
+        user_input = str(item.get("input", item.get("user_input", ""))).strip()
+        impact = _normalize_impact(item.get("impact", item.get("severity", "")))
+        if scenario and user_input:
+            parsed.append(AttackCase(scenario=scenario, user_input=user_input, impact=impact))
+    return _dedupe_cases(parsed)
+
+
+def _parse_rubric_items(data: object) -> list[RubricItem]:
+    raw_items = data if isinstance(data, list) else []
+    parsed: list[RubricItem] = []
+    for raw in raw_items:
+        if isinstance(raw, str):
+            rule = raw.strip()
+            level = _DEFAULT_RULE_LEVEL
+            why = ""
+        elif isinstance(raw, dict):
+            rule = str(raw.get("rule", "")).strip()
+            level = _normalize_rule_level(raw.get("level"))
+            why = str(raw.get("why", "")).strip()
+        else:
+            continue
+        if rule:
+            parsed.append(RubricItem(rule=rule, level=level, why=why))
+    return _dedupe_rubric_items(parsed)
+
+
 def serialize_attack_cases(cases: list[AttackCase]) -> list[dict[str, str]]:
     return [
         {
@@ -253,17 +306,7 @@ def deserialize_attack_cases(data: object) -> list[AttackCase]:
     if not isinstance(data, list):
         raise ValueError("Snapshot format is invalid: 'cases' must be a list.")
 
-    parsed: list[AttackCase] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        scenario = str(item.get("scenario", "")).strip()
-        user_input = str(item.get("input", item.get("user_input", ""))).strip()
-        impact = _normalize_impact(item.get("impact", item.get("severity", "")))
-        if scenario and user_input:
-            parsed.append(AttackCase(scenario=scenario, user_input=user_input, impact=impact))
-
-    deduped = _dedupe_cases(parsed)
+    deduped = _parse_attack_case_items(data)
     if not deduped:
         raise ValueError("Snapshot contains no valid cases.")
     return deduped
@@ -277,22 +320,7 @@ def extract_judge_rubric(client: ChatClient, *, model: str, skill_md: str) -> li
     if not isinstance(raw_items, list):
         raise ValueError("Rubric extraction returned an invalid format: 'rubric' must be a list.")
 
-    parsed: list[RubricItem] = []
-    for raw in raw_items:
-        if isinstance(raw, str):
-            rule = raw.strip()
-            level = _DEFAULT_RULE_LEVEL
-            why = ""
-        elif isinstance(raw, dict):
-            rule = str(raw.get("rule", "")).strip()
-            level = _normalize_rule_level(raw.get("level"))
-            why = str(raw.get("why", "")).strip()
-        else:
-            continue
-        if rule:
-            parsed.append(RubricItem(rule=rule, level=level, why=why))
-
-    deduped = _dedupe_rubric_items(parsed)
+    deduped = _parse_rubric_items(raw_items)
     if not deduped:
         raise ValueError("Rubric extraction returned no valid rules.")
     return deduped
@@ -310,7 +338,7 @@ def _parse_checklist_results(data: object, rubric: list[RubricItem]) -> list[Che
                 rule=rubric_item.rule,
                 level=rubric_item.level,
                 status=_normalize_checklist_status(raw.get("status")) if isinstance(raw, dict) else _DEFAULT_CHECKLIST_STATUS,
-                notes=notes or "No explicit checklist finding returned by the judge.",
+                notes=notes or _DEFAULT_CHECKLIST_NOTES,
             )
         )
     return ordered
@@ -446,19 +474,7 @@ def generate_attack_cases(client: ChatClient, *, model: str, skill_md: str) -> l
     payload = ATTACKER_PROMPT + "\n\n---\nSkill document:\n" + skill_md
     data = chat_json(client, model=model, messages=[{"role": "user", "content": payload}], temperature=0.7)
 
-    generated: list[AttackCase] = []
-    raw_cases = data.get("cases", [])
-    if isinstance(raw_cases, list):
-        for item in raw_cases:
-            if not isinstance(item, dict):
-                continue
-            scenario = str(item.get("scenario", "")).strip()
-            user_input = str(item.get("input", item.get("user_input", ""))).strip()
-            impact = _normalize_impact(item.get("impact", item.get("severity", "")))
-            if scenario and user_input:
-                generated.append(AttackCase(scenario=scenario, user_input=user_input, impact=impact))
-
-    cases = _dedupe_cases(generated)
+    cases = _parse_attack_case_items(data.get("cases", []))
     if len(cases) < 5:
         cases = _dedupe_cases([*cases, *_FALLBACK_ATTACK_CASES])
 

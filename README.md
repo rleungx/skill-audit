@@ -77,3 +77,13 @@ export GOOGLE_API_KEY="your_key"
 export MINIMAX_API_KEY="your_key"
 ./dist/skill-audit --file SKILL.md --provider minimax --model MiniMax-M2.5
 ```
+
+## 4. Validate locally
+
+```bash
+python -m unittest discover -s tests -t . -v
+python -m py_compile src/skill_audit/cli.py
+node -c src/skill_audit/assets/report.ts
+```
+
+CI runs the same checks, then builds `./dist/skill-audit`.

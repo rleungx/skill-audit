@@ -45,7 +45,7 @@ def _load_report_renderer_ts() -> str:
         raise RuntimeError(f"Cannot load report renderer asset: {e}") from e
 
 
-def render_html_report(
+def _build_report_data(
     *,
     skill_path: str,
     provider: str,
@@ -54,11 +54,11 @@ def render_html_report(
     rubric: list[RubricItem],
     results: list[CaseResult],
     created_at: datetime,
-) -> str:
+) -> dict[str, object]:
     created = created_at.strftime("%Y-%m-%d %H:%M:%S")
     benchmark_score = max(0.0, min(100.0, float(summary.benchmark_score)))
 
-    report_data = {
+    return {
         "createdAt": created,
         "skillPath": skill_path,
         "provider": provider,
@@ -88,20 +88,20 @@ def render_html_report(
         ],
         "results": [
             {
-                "scenario": r.case.scenario,
-                "userInput": r.case.user_input,
-                "impact": r.case.impact,
-                "aiResponse": r.ai_response,
-                "benchmarkScore": r.judge.benchmark_score,
-                "violation": bool(r.judge.violation),
-                "blockingFailure": bool(r.judge.blocking_failure),
-                "applicableRules": int(r.judge.applicable_rules),
-                "passedRules": int(r.judge.passed_rules),
-                "failedRules": int(r.judge.failed_rules),
-                "notApplicableRules": int(r.judge.not_applicable_rules),
-                "hardFailRules": int(r.judge.hard_fail_rules),
-                "reason": r.judge.reason,
-                "fixSuggestion": r.judge.fix_suggestion,
+                "scenario": result.case.scenario,
+                "userInput": result.case.user_input,
+                "impact": result.case.impact,
+                "aiResponse": result.ai_response,
+                "benchmarkScore": result.judge.benchmark_score,
+                "violation": bool(result.judge.violation),
+                "blockingFailure": bool(result.judge.blocking_failure),
+                "applicableRules": int(result.judge.applicable_rules),
+                "passedRules": int(result.judge.passed_rules),
+                "failedRules": int(result.judge.failed_rules),
+                "notApplicableRules": int(result.judge.not_applicable_rules),
+                "hardFailRules": int(result.judge.hard_fail_rules),
+                "reason": result.judge.reason,
+                "fixSuggestion": result.judge.fix_suggestion,
                 "checklist": [
                     {
                         "rule": item.rule,
@@ -109,15 +109,36 @@ def render_html_report(
                         "status": item.status,
                         "notes": item.notes,
                     }
-                    for item in r.judge.checklist
+                    for item in result.judge.checklist
                 ],
             }
-            for r in results
+            for result in results
         ],
     }
 
+
+def render_html_report(
+    *,
+    skill_path: str,
+    provider: str,
+    model: str,
+    summary: AuditSummary,
+    rubric: list[RubricItem],
+    results: list[CaseResult],
+    created_at: datetime,
+) -> str:
     renderer_ts = _load_report_renderer_ts()
-    data_json = _safe_json_for_html(report_data)
+    data_json = _safe_json_for_html(
+        _build_report_data(
+            skill_path=skill_path,
+            provider=provider,
+            model=model,
+            summary=summary,
+            rubric=rubric,
+            results=results,
+            created_at=created_at,
+        )
+    )
 
     return f"""<!doctype html>
 <html lang="en">

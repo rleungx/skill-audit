@@ -20,6 +20,29 @@ class ChatClient(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _split_system_messages(messages: list[dict[str, str]]) -> tuple[str, list[tuple[str, str]]]:
+    system_parts: list[str] = []
+    non_system_messages: list[tuple[str, str]] = []
+    for message in messages:
+        role = str(message.get("role", "")).strip().lower()
+        content = str(message.get("content", ""))
+        if role == "system":
+            if content.strip():
+                system_parts.append(content.strip())
+            continue
+        non_system_messages.append((role, content))
+    return "\n\n".join(system_parts).strip(), non_system_messages
+
+
+def _extract_text_parts(parts: object, *, text_key: str = "text") -> str:
+    texts: list[str] = []
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get(text_key), str):
+                texts.append(part[text_key])
+    return "\n".join(texts).strip()
+
+
 def _http_post_json(*, url: str, headers: dict[str, str], payload: dict[str, Any], timeout_s: int) -> dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(url=url, data=data, headers=headers, method="POST")
@@ -102,15 +125,9 @@ class AnthropicClient:
     ) -> dict[str, Any]:
         del response_format  # Intentionally accepted for OpenAI-compat call sites.
 
-        system_parts: list[str] = []
+        system_prompt, raw_messages = _split_system_messages(messages)
         anthropic_messages: list[dict[str, Any]] = []
-        for m in messages:
-            role = str(m.get("role", "")).strip().lower()
-            content = str(m.get("content", ""))
-            if role == "system":
-                if content.strip():
-                    system_parts.append(content.strip())
-                continue
+        for role, content in raw_messages:
             if role not in {"user", "assistant"}:
                 continue
             anthropic_messages.append({"role": role, "content": content})
@@ -121,7 +138,6 @@ class AnthropicClient:
             "max_tokens": int(max_tokens or 800),
             "temperature": temperature,
         }
-        system_prompt = "\n\n".join(system_parts).strip()
         if system_prompt:
             payload["system"] = system_prompt
 
@@ -133,15 +149,12 @@ class AnthropicClient:
         }
         resp_data = _http_post_json(url=url, headers=headers, payload=payload, timeout_s=self._timeout_s)
 
-        content_texts: list[str] = []
         content_blocks = resp_data.get("content")
+        text = ""
         if isinstance(content_blocks, list):
-            for block in content_blocks:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text" and isinstance(block.get("text"), str):
-                    content_texts.append(block["text"])
-        text = "\n".join(content_texts).strip()
+            text = _extract_text_parts(
+                [block for block in content_blocks if isinstance(block, dict) and block.get("type") == "text"]
+            )
         if not text and isinstance(resp_data.get("completion"), str):
             text = resp_data["completion"].strip()
 
@@ -165,15 +178,9 @@ class GoogleClient:
     ) -> dict[str, Any]:
         del response_format  # Intentionally accepted for OpenAI-compat call sites.
 
-        system_parts: list[str] = []
+        system_prompt, raw_messages = _split_system_messages(messages)
         contents: list[dict[str, Any]] = []
-        for m in messages:
-            role = str(m.get("role", "")).strip().lower()
-            content = str(m.get("content", ""))
-            if role == "system":
-                if content.strip():
-                    system_parts.append(content.strip())
-                continue
+        for role, content in raw_messages:
             if role == "assistant":
                 role = "model"
             if role not in {"user", "model"}:
@@ -184,7 +191,6 @@ class GoogleClient:
             "contents": contents,
             "generationConfig": {"temperature": temperature, "maxOutputTokens": int(max_tokens or 800)},
         }
-        system_prompt = "\n\n".join(system_parts).strip()
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
@@ -196,18 +202,13 @@ class GoogleClient:
         resp_data = _http_post_json(url=url, headers=headers, payload=payload, timeout_s=self._timeout_s)
 
         # Google response shape: candidates[0].content.parts[].text
-        text_parts: list[str] = []
+        text = ""
         candidates = resp_data.get("candidates")
         if isinstance(candidates, list) and candidates:
             cand0 = candidates[0] if isinstance(candidates[0], dict) else {}
             content = cand0.get("content") if isinstance(cand0, dict) else None
             if isinstance(content, dict):
-                parts = content.get("parts")
-                if isinstance(parts, list):
-                    for p in parts:
-                        if isinstance(p, dict) and isinstance(p.get("text"), str):
-                            text_parts.append(p["text"])
-        text = "\n".join(text_parts).strip()
+                text = _extract_text_parts(content.get("parts"))
 
         return {"choices": [{"message": {"content": text}}], "raw": resp_data}
 

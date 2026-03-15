@@ -1,49 +1,75 @@
-from __future__ import annotations
-
 import json
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 
-from skill_audit.evaluator import AttackCase
-from skill_audit.storage import default_report_path, default_snapshot_path, load_snapshot_cases, write_snapshot, write_text_file
+from skill_audit.models import AttackCase, AttackTurn, RubricItem
+from skill_audit.storage import load_cache, load_snapshot, save_cache, write_snapshot
 
 
 class StorageTests(unittest.TestCase):
-    def test_default_paths_use_consistent_timestamp_format(self) -> None:
-        created_at = datetime(2026, 3, 6, 9, 8, 7, 123456)
+    def test_snapshot_roundtrip(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            data = {
+                "version": 4,
+                "metadata": {},
+                "rubric": [{"rule": "rule", "level": "required"}],
+                "cases": [{"scenario": "scen", "risk_category": "risk", "impact": "medium", "turns": ["in"]}]
+            }
+            write_snapshot(tmp_path, data)
+            
+            loaded = load_snapshot(tmp_path)
+            self.assertEqual(len(loaded["cases"]), 1)
+            self.assertEqual(loaded["cases"][0].scenario, "scen")
+            self.assertEqual(loaded["rubric"][0].rule, "rule")
+        finally:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
 
-        self.assertTrue(default_snapshot_path(created_at).endswith("snapshot_20260306_090807_123456.json"))
-        self.assertTrue(default_report_path(created_at).endswith("report_20260306_090807_123456.html"))
+    def test_cache_logic_respects_models(self) -> None:
+        skill = "test skill"
+        cases = [AttackCase("s", [AttackTurn("i")], "r")]
+        rubric = [RubricItem("rule")]
+        
+        # Save cache for model A
+        save_cache(skill, "modelA", "atkA", "jdgA", rubric, cases)
+        
+        # Load cache for model A should work
+        cached = load_cache(skill, "modelA", "atkA", "jdgA")
+        self.assertIsNotNone(cached)
+        
+        # Load cache for model B should fail
+        cached_b = load_cache(skill, "modelB", "atkA", "jdgA")
+        self.assertIsNone(cached_b)
 
-    def test_write_snapshot_and_load_snapshot_cases_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "nested" / "snapshot.json"
-            write_snapshot(
-                str(path),
-                {
-                    "version": 1,
-                    "cases": [
-                        {"scenario": "a", "input": "hello", "impact": "high"},
-                        {"scenario": "b", "user_input": "hello", "severity": "critical"},
-                    ],
-                },
-            )
+    def test_load_snapshot_rejects_unsupported_version(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
 
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            loaded = load_snapshot_cases(str(path))
+        try:
+            with Path(tmp_path).open("w", encoding="utf-8") as file:
+                json.dump({"version": 3, "metadata": {}, "rubric": [], "cases": []}, file)
+            with self.assertRaises(ValueError):
+                load_snapshot(tmp_path)
+        finally:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
 
-        self.assertEqual(raw["version"], 1)
-        self.assertEqual(loaded, [AttackCase(scenario="a", user_input="hello", impact="high")])
+    def test_load_snapshot_rejects_invalid_cases_shape(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
 
-    def test_write_text_file_creates_parent_directories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "a" / "b" / "report.html"
-            write_text_file(str(path), "hello")
-
-            self.assertEqual(path.read_text(encoding="utf-8"), "hello")
-
+        try:
+            with Path(tmp_path).open("w", encoding="utf-8") as file:
+                json.dump({"version": 4, "metadata": {}, "rubric": [], "cases": {}}, file)
+            with self.assertRaises(ValueError):
+                load_snapshot(tmp_path)
+        finally:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
 
 if __name__ == "__main__":
     unittest.main()

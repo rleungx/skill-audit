@@ -12,6 +12,9 @@ dependencies = []
 
 [project.optional-dependencies]
 binary = ["pyinstaller>=6.0"]
+dev = [
+    "ruff>=0.11.0",
+]
 
 [project.scripts]
 skill-audit = "skill_audit.cli:main"
@@ -22,5 +25,15 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-skill_audit = ["assets/*.ts"]
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "I",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["skill_audit"]

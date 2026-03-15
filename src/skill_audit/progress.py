@@ -4,7 +4,6 @@ import sys
 import threading
 from typing import Any, Callable, TextIO, TypeVar
 
-
 _DEFAULT_SPINNER_FRAMES = ("|", "/", "-", "\\")
 _DEFAULT_SPINNER_INTERVAL_S = 0.35
 

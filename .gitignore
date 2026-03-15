@@ -6,3 +6,6 @@ dist/
 *.egg-info/
 .pytest_cache/
 report_*.html
+.tmp-omo/
+out/
+*.tgz

@@ -1,5 +1,5 @@
-import io
 import argparse
+import io
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .client import ChatClient, chat_json
-from .models import AttackCase, AttackTurn
+from .models import AttackCase
 from .prompts import ATTACKER_SYSTEM_PROMPT, ATTACKER_USER_PROMPT_TEMPLATE, RISK_TAXONOMY
 from .turns import normalize_attack_turns
 

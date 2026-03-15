@@ -6,7 +6,7 @@ from pathlib import Path
 repo_root = Path(SPECPATH).resolve()
 entry_script = repo_root / "src" / "skill_audit" / "__main__.py"
 pathex = [str(repo_root / "src")]
-datas = [(str(repo_root / "src" / "skill_audit" / "assets" / "report.ts"), "skill_audit/assets")]
+datas = []
 
 
 a = Analysis(

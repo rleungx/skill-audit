@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from .evaluator import (
+from .api import (
     AttackCase,
     AuditSummary,
     CaseResult,
+    RubricItem,
     build_case_snapshot,
+    deserialize_attack_cases,
+    deserialize_rubric_items,
     extract_judge_rubric,
     generate_attack_cases,
     generate_frozen_attack_cases,
@@ -17,215 +21,306 @@ from .evaluator import (
     run_skill_response,
     summarize_audit,
 )
+from .client import ChatClient
+from .lint import LintFinding, lint_skill_document
 from .progress import ProgressReporter
 from .providers import (
     PROVIDER_CHOICES,
-    PROVIDER_HELP_TEXT,
     build_client,
     format_runtime_hint,
     resolve_api_key,
     resolve_base_url,
 )
+from .redact import redact_text
 from .report import render_html_report
 from .storage import (
     default_report_path,
     default_snapshot_path,
-    load_snapshot_cases,
+    load_cache,
+    load_snapshot,
+    save_cache,
     write_snapshot,
     write_text_file,
 )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="skill-audit: automated red-team auditor for SKILL.md")
-    parser.add_argument("--file", required=True, help="Path to the SKILL.md file to evaluate")
-    parser.add_argument(
-        "--provider",
-        choices=PROVIDER_CHOICES,
-        default="ollama",
-        help=PROVIDER_HELP_TEXT,
-    )
-    parser.add_argument("--model", required=True, help="Model name, e.g. gpt-oss or gpt-5.4")
-    parser.add_argument(
-        "--key",
-        help="API key (required for OpenAI/MiniMax/Anthropic/Google; optional for Ollama)",
-    )
-    parser.add_argument(
-        "--url",
-        help=(
-            "Custom API base URL (Ollama default http://localhost:11434/v1; "
-            "MiniMax default https://api.minimax.io/v1; "
-            "Anthropic default https://api.anthropic.com/v1; "
-            "Google default https://generativelanguage.googleapis.com/v1beta)"
-        ),
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=80,
-        help="Pass threshold for benchmark score (0-100), default 80. Exit 1 if below or if blocking failures occur.",
-    )
-    parser.add_argument(
-        "--report",
-        help="Output report path (default: system temp dir/report_YYYYMMDD_HHMMSS_microseconds.html)",
-    )
-    parser.add_argument(
-        "--snapshot",
-        help="Replay evaluation against a saved snapshot JSON file for stable benchmark runs.",
-    )
-    parser.add_argument(
-        "--freeze",
-        nargs="?",
-        const="",
-        help="Generate 5 adversarial cases, optionally write them to the given snapshot path, and exit. Default path is the system temp dir.",
-    )
+    parser = argparse.ArgumentParser(description="skill-audit: industrial security auditor")
+    parser.add_argument("--file", required=True, help="SKILL.md path")
+    parser.add_argument("--provider", choices=PROVIDER_CHOICES + ("http",), default="ollama")
+    parser.add_argument("--model", required=True, help="Target model")
+    parser.add_argument("--attacker-provider", choices=PROVIDER_CHOICES + ("http",))
+    parser.add_argument("--attacker-model")
+    parser.add_argument("--judge-provider", choices=PROVIDER_CHOICES + ("http",))
+    parser.add_argument("--judge-model")
+    parser.add_argument("--key")
+    parser.add_argument("--url")
+    parser.add_argument("--threshold", type=int, default=80)
+    parser.add_argument("--report")
+    parser.add_argument("--snapshot")
+    parser.add_argument("--freeze", nargs="?", const="")
+    parser.add_argument("--concurrency", "-j", type=int, default=1)
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--no-lint", action="store_true", help="Disable static lint checks on the Skill document.")
+    parser.add_argument("--fail-on-lint", action="store_true", help="Fail the audit when lint finds high/critical issues.")
+    parser.add_argument("--no-redact", action="store_true", help="Do not redact suspected secrets in the HTML report (unsafe).")
     return parser
 
 
-def _evaluate_case(*, client, model: str, skill_md: str, rubric, case: AttackCase) -> CaseResult:
-    ai_response = run_skill_response(client, model=model, skill_md=skill_md, case=case)
-    judge = judge_case(
-        client,
-        model=model,
-        rubric=rubric,
-        impact=case.impact,
-        user_input=case.user_input,
-        ai_response=ai_response,
+def _resolve_client(
+    *,
+    provider: str,
+    api_key: str | None,
+    base_url: str | None,
+) -> ChatClient:
+    return build_client(
+        provider,
+        base_url=resolve_base_url(provider, base_url),
+        api_key=resolve_api_key(provider, api_key),
     )
-    return CaseResult(case=case, ai_response=ai_response, judge=judge)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    progress = ProgressReporter()
+def _evaluate_case(
+    *,
+    target_client: ChatClient,
+    target_model: str,
+    judge_client: ChatClient,
+    judge_model: str,
+    skill_md: str,
+    rubric: list[RubricItem],
+    case: AttackCase,
+) -> CaseResult:
+    responses = run_skill_response(target_client, model=target_model, skill_md=skill_md, case=case)
+    judge = judge_case(
+        judge_client,
+        model=judge_model,
+        rubric=rubric,
+        case=case,
+        responses=responses,
+        skill_md=skill_md,
+    )
+    return CaseResult(case=case, ai_responses=responses, judge=judge)
 
+
+def _validate_args(args: argparse.Namespace) -> None:
     if args.freeze is not None and args.snapshot:
-        parser.error("use either --freeze or --snapshot, not both in the same run")
+        raise ValueError("use either --freeze or --snapshot, not both")
+    if args.no_lint and args.fail_on_lint:
+        raise ValueError("--fail-on-lint requires lint enabled (remove --no-lint)")
+    if args.concurrency < 1:
+        raise ValueError("--concurrency must be >= 1")
+    if not 0 <= args.threshold <= 100:
+        raise ValueError("--threshold must be between 0 and 100")
 
-    threshold = max(0, min(100, int(args.threshold)))
-    base_url = resolve_base_url(args.provider, args.url)
-    created_at = datetime.now()
 
-    try:
-        progress.render(2, "Initializing")
-        api_key = resolve_api_key(args.provider, args.key)
-        client = build_client(args.provider, base_url=base_url, api_key=api_key, timeout_s=90)
+def _load_skill_and_lint(*, file_path: str, no_lint: bool) -> tuple[str, list[LintFinding]]:
+    skill_md = Path(file_path).read_text(encoding="utf-8")
+    lint_findings = [] if no_lint else lint_skill_document(skill_md)
+    return skill_md, lint_findings
 
-        progress.render(5, "Loading skill file")
-        skill_md = Path(args.file).read_text(encoding="utf-8")
 
-        if args.freeze is not None:
-            cases = progress.run_with_spinner(
-                15,
-                "Generating snapshot cases",
-                generate_frozen_attack_cases,
-                client,
-                model=args.model,
-                skill_md=skill_md,
-            )
-            if not cases:
-                raise RuntimeError("No attack cases were generated (check that the model returned valid JSON).")
-            progress.render(85, f"Generated {len(cases)} snapshot cases")
-            snapshot = build_case_snapshot(skill_path=args.file, cases=cases, created_at=created_at)
-            freeze_path = args.freeze or default_snapshot_path(created_at)
-            progress.render(95, "Writing snapshot")
-            write_snapshot(freeze_path, snapshot)
-            progress.render(100, "Snapshot ready")
-            progress.finish()
-            print(f"🔒 Saved {len(cases)} cases to snapshot {freeze_path}")
-            raise SystemExit(0)
+def _build_clients(args: argparse.Namespace) -> tuple[ChatClient, ChatClient, ChatClient]:
+    target_provider = args.provider
+    attacker_provider = args.attacker_provider or target_provider
+    judge_provider = args.judge_provider or target_provider
+    return (
+        _resolve_client(provider=target_provider, api_key=args.key, base_url=args.url),
+        _resolve_client(provider=attacker_provider, api_key=args.key, base_url=args.url),
+        _resolve_client(provider=judge_provider, api_key=args.key, base_url=args.url),
+    )
 
-        mode = "snapshot" if args.snapshot else "random"
-        if args.snapshot:
-            progress.render(10, "Loading snapshot")
-            cases = load_snapshot_cases(args.snapshot)
-            progress.render(20, f"Loaded snapshot ({len(cases)} cases)")
-        else:
-            cases = progress.run_with_spinner(
-                15,
-                "Generating attack cases",
-                generate_attack_cases,
-                client,
-                model=args.model,
-                skill_md=skill_md,
-            )
-            if not cases:
-                raise RuntimeError("No attack cases were generated (check that the model returned valid JSON).")
-            progress.render(25, f"Generated {len(cases)} attack cases")
-        rubric = progress.run_with_spinner(
-            30,
-            "Extracting judge rubric",
-            extract_judge_rubric,
-            client,
-            model=args.model,
-            skill_md=skill_md,
-        )
-        progress.render(40, f"Loaded rubric ({len(rubric)} rules)")
-        total_cases = len(cases)
-        results: list[CaseResult] = []
 
-        for index, case in enumerate(cases, start=1):
-            start_percent = 40 + int(((index - 1) / total_cases) * 55)
-            end_percent = 40 + int((index / total_cases) * 55)
-            result = progress.run_with_spinner(
-                start_percent,
-                f"Evaluating case {index}/{total_cases}",
+def _load_cases_and_rubric(
+    *,
+    args: argparse.Namespace,
+    skill_md: str,
+    attacker_client: ChatClient,
+    attacker_model: str,
+    judge_client: ChatClient,
+    judge_model: str,
+    progress: ProgressReporter,
+) -> tuple[list[AttackCase], list[RubricItem]]:
+    if args.snapshot:
+        snapshot = load_snapshot(args.snapshot)
+        progress.render(10, "Using snapshot (replay mode)")
+        cases = snapshot["cases"]
+        rubric = snapshot["rubric"]
+        if not cases:
+            raise ValueError(f"Snapshot did not contain any valid cases: {args.snapshot}")
+        if not rubric:
+            raise ValueError(f"Snapshot did not contain any rubric rules: {args.snapshot}")
+        return cases, rubric
+
+    cached = load_cache(skill_md, args.model, attacker_model, judge_model) if not args.no_cache else None
+    if cached:
+        progress.render(10, "Using cache")
+        cases = deserialize_attack_cases(cached.get("cases", []))
+        rubric = deserialize_rubric_items(cached.get("rubric", []))
+        if not cases:
+            raise ValueError("Cache did not contain any valid cases. Re-run with --no-cache to regenerate them.")
+        if not rubric:
+            raise ValueError("Cache did not contain any rubric rules. Re-run with --no-cache to regenerate them.")
+        return cases, rubric
+
+    cases = generate_attack_cases(attacker_client, model=attacker_model, skill_md=skill_md)
+    rubric = extract_judge_rubric(judge_client, model=judge_model, skill_md=skill_md)
+    if not cases:
+        return cases, rubric
+    if not rubric:
+        return cases, rubric
+    if not args.no_cache:
+        save_cache(skill_md, args.model, attacker_model, judge_model, rubric, cases)
+    return cases, rubric
+
+
+def _run_case_evaluations(
+    *,
+    target_client: ChatClient,
+    target_model: str,
+    judge_client: ChatClient,
+    judge_model: str,
+    skill_md: str,
+    rubric: list[RubricItem],
+    cases: list[AttackCase],
+    concurrency: int,
+    progress: ProgressReporter,
+) -> list[CaseResult]:
+    total = len(cases)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        results_by_index: list[CaseResult | None] = [None] * total
+        futures = {
+            executor.submit(
                 _evaluate_case,
-                client=client,
-                model=args.model,
+                target_client=target_client,
+                target_model=target_model,
+                judge_client=judge_client,
+                judge_model=judge_model,
                 skill_md=skill_md,
                 rubric=rubric,
                 case=case,
+            ): index
+            for index, case in enumerate(cases)
+        }
+        for completed_index, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            case_index = futures[future]
+            results_by_index[case_index] = future.result()
+            progress.render(40 + int((completed_index / total) * 55), "Evaluating", current=completed_index, total=total)
+    return [result for result in results_by_index if result is not None]
+
+
+def _build_failure_note(summary: AuditSummary, *, fail_on_lint: bool) -> str:
+    failure_notes: list[str] = []
+    if summary.blocking_failure_count:
+        count = summary.blocking_failure_count
+        failure_notes.append(f"{count} blocking case{'s' if count != 1 else ''}")
+    if fail_on_lint and summary.lint_blocking_count:
+        count = summary.lint_blocking_count
+        failure_notes.append(f"{count} blocking lint finding{'s' if count != 1 else ''}")
+    if not failure_notes:
+        failure_notes.append("Review the failing cases in the report")
+    return ". ".join(failure_notes) if failure_notes else "Review the report for details"
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _build_parser().parse_args(argv)
+    try:
+        _validate_args(args)
+    except ValueError as error:
+        print(f"Argument error: {error}. See 'skill-audit --help' for usage details.")
+        raise SystemExit(2)
+
+    progress = ProgressReporter()
+    created_at = datetime.now()
+
+    try:
+        skill_md, lint_findings = _load_skill_and_lint(file_path=args.file, no_lint=args.no_lint)
+        progress.render(2, "Initializing")
+        target_client, attacker_client, judge_client = _build_clients(args)
+
+        attacker_model = args.attacker_model or args.model
+        judge_model = args.judge_model or args.model
+
+        # 1. Freeze Path
+        if args.freeze is not None:
+            cases = generate_frozen_attack_cases(attacker_client, model=attacker_model, skill_md=skill_md)
+            rubric = extract_judge_rubric(judge_client, model=judge_model, skill_md=skill_md)
+            if not rubric:
+                raise ValueError("No rubric rules were generated. Re-run the audit to regenerate them.")
+            snapshot_path = args.freeze or default_snapshot_path(created_at)
+            write_snapshot(
+                snapshot_path,
+                build_case_snapshot(skill_path=args.file, cases=cases, rubric=rubric),
             )
-            results.append(result)
-            progress.render(end_percent, "Evaluating cases", current=index, total=total_cases)
+            print(f"Snapshot saved to {snapshot_path}.")
+            return
 
-        summary: AuditSummary = summarize_audit(results, mode=mode, threshold=threshold)
-        report_path = args.report or default_report_path(created_at)
-        html_report = progress.run_with_spinner(
-            97,
-            "Rendering report",
-            render_html_report,
-            skill_path=args.file,
-            provider=args.provider,
-            model=args.model,
-            summary=summary,
+        cases, rubric = _load_cases_and_rubric(
+            args=args,
+            skill_md=skill_md,
+            attacker_client=attacker_client,
+            attacker_model=attacker_model,
+            judge_client=judge_client,
+            judge_model=judge_model,
+            progress=progress,
+        )
+        if not cases:
+            raise ValueError("No audit cases were loaded. Re-run with a valid snapshot or regenerate cases.")
+        if not rubric:
+            raise ValueError("No rubric rules were loaded. Re-run the audit to regenerate them.")
+
+        results = _run_case_evaluations(
+            target_client=target_client,
+            target_model=args.model,
+            judge_client=judge_client,
+            judge_model=judge_model,
+            skill_md=skill_md,
             rubric=rubric,
-            results=results,
-            created_at=created_at,
+            cases=cases,
+            concurrency=args.concurrency,
+            progress=progress,
         )
-        progress.render(99, "Writing report")
-        write_text_file(report_path, html_report)
-        progress.render(100, "Completed")
-        progress.finish()
 
-        score_text = f"{summary.benchmark_score:.1f}/100"
-        status_suffix = (
-            f", blocking failures: {summary.blocking_failure_count}"
-            if summary.blocking_failure_count
-            else ""
+        summary = summarize_audit(
+            results,
+            threshold=args.threshold,
+            lint_findings=lint_findings,
+            fail_on_lint=args.fail_on_lint,
         )
+        report_path = args.report or default_report_path(created_at)
+        write_text_file(
+            report_path,
+            render_html_report(
+                skill_path=args.file,
+                provider=args.provider,
+                model=args.model,
+                summary=summary,
+                results=results,
+                created_at=created_at,
+                redact=not args.no_redact,
+            ),
+        )
+
+        progress.finish()
+        print(f"Report written to {report_path}.")
         if not summary.passed:
-            print(f"Evaluation failed ({score_text}{status_suffix}). Report: {report_path}")
+            note = _build_failure_note(summary, fail_on_lint=args.fail_on_lint)
+            print(f"FAILED ({summary.benchmark_score}%). Threshold: {args.threshold}%. {note}.")
             raise SystemExit(1)
-        print(f"Evaluation passed ({score_text}). Report: {report_path}")
-        raise SystemExit(0)
+        print(f"PASSED ({summary.benchmark_score}%). Threshold: {args.threshold}%.")
     except SystemExit:
         progress.finish()
         raise
-    except (FileNotFoundError, PermissionError) as e:
+    except Exception as error:
         progress.finish()
-        print(f"Cannot read file: {e}")
-        raise SystemExit(2)
-    except ValueError as e:
-        progress.finish()
-        print(f"Argument error: {e}")
-        raise SystemExit(2)
-    except Exception as e:
-        progress.finish()
-        print(f"Run failed: {e}")
-        hint = format_runtime_hint(args.provider, base_url=base_url, error=e)
-        if hint:
-            print(hint)
+        hint = format_runtime_hint(
+            args.provider,
+            base_url=resolve_base_url(args.provider, args.url),
+            error=error,
+        )
+        error_text = str(error)
+        hint_text = hint
+        if not args.no_redact:
+            error_text = redact_text(error_text)
+            hint_text = redact_text(hint_text)
+        print(f"Run failed: {error_text}\n{hint_text}")
         raise SystemExit(2)

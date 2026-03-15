@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import random
 import socket
+import time
 from typing import Any, Protocol
-from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -34,293 +37,232 @@ def _split_system_messages(messages: list[dict[str, str]]) -> tuple[str, list[tu
     return "\n\n".join(system_parts).strip(), non_system_messages
 
 
-def _extract_text_parts(parts: object, *, text_key: str = "text") -> str:
-    texts: list[str] = []
-    if isinstance(parts, list):
-        for part in parts:
-            if isinstance(part, dict) and isinstance(part.get(text_key), str):
-                texts.append(part[text_key])
-    return "\n".join(texts).strip()
+def _wrap_text_response(content: object, *, raw: object) -> dict[str, Any]:
+    return {"choices": [{"message": {"content": str(content or "")}}], "raw": raw}
 
 
-def _http_post_json(*, url: str, headers: dict[str, str], payload: dict[str, Any], timeout_s: int) -> dict[str, Any]:
+def _join_text_parts(parts: object) -> str:
+    if not isinstance(parts, list):
+        return ""
+    return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+
+
+def _is_localhost(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    normalized = hostname.strip().lower()
+    return normalized in ("localhost", "127.0.0.1", "::1")
+
+
+def _http_post_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout_s: int,
+    max_retries: int = 3,
+    max_response_bytes: int = 5 * 1024 * 1024,
+) -> dict[str, Any]:
+    headers = headers.copy()
+    headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    )
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
+    if not parsed_url.netloc:
+        raise ValueError(f"Invalid URL: {url!r}")
+    allow_insecure_http = os.environ.get("SKILL_AUDIT_ALLOW_INSECURE_HTTP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    lower_header_keys = {key.lower() for key in headers}
+    has_header_credentials = "authorization" in lower_header_keys or "x-api-key" in lower_header_keys
+    query_params = parse_qs(parsed_url.query)
+    has_query_credentials = any(
+        key in query_params and any(len(value) >= 8 for value in query_params.get(key, []))
+        for key in ("key", "api_key", "apikey", "token")
+    )
+    if (
+        parsed_url.scheme == "http"
+        and (has_header_credentials or has_query_credentials)
+        and not allow_insecure_http
+        and not _is_localhost(parsed_url.hostname)
+    ):
+        raise ValueError(
+            "Refusing to send credentials over insecure HTTP. Use https or set SKILL_AUDIT_ALLOW_INSECURE_HTTP=1."
+        )
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(url=url, data=data, headers=headers, method="POST")
-    try:
-        with urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except HTTPError as e:
-        err_body = ""
+    last_err = None
+    for attempt in range(max_retries + 1):
         try:
-            err_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"HTTP {e.code} {e.reason}: {err_body}".strip()) from e
-    except URLError as e:
-        raise RuntimeError(f"Request failed: {e}") from e
-    except socket.timeout as e:
-        raise RuntimeError(f"Request timed out after {timeout_s}s") from e
+            if attempt > 0:
+                time.sleep((2**attempt) + random.uniform(0, 1))
+            with urlopen(req, timeout=timeout_s) as response:
+                body_bytes = response.read(max_response_bytes + 1)
+                if len(body_bytes) > max_response_bytes:
+                    raise RuntimeError(f"Response too large (>{max_response_bytes} bytes)")
+                body = body_bytes.decode("utf-8", errors="replace")
+                return json.loads(body)
+        except (HTTPError, URLError, socket.timeout, ConnectionError) as e:
+            last_err = e
+            if isinstance(e, HTTPError) and e.code == 403:
+                error_body = e.read(2000).decode("utf-8", "replace")[:200]
+                raise RuntimeError(f"HTTP 403 Forbidden: Regional block or WAF. Body: {error_body}") from e
+            if attempt >= max_retries:
+                raise RuntimeError(f"Request failed: {last_err}")
+    raise RuntimeError("Request failed")
 
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Non-JSON response: {body[:500]}") from e
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Invalid JSON response (expected object): {body[:500]}")
-    return data
 
-
-class OpenAICompatClient:
+class OpenAIChatClient:
     def __init__(self, base_url: str, api_key: str = "", timeout_s: int = 60):
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout_s = timeout_s
+        self._base_url, self._api_key, self._timeout_s = base_url.rstrip("/"), api_key, timeout_s
 
-    def chat_completions_create(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, str]],
-        temperature: float = 0.2,
-        max_tokens: int | None = 800,
-        response_format: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    def chat_completions_create(self, *, model: str, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
         url = f"{self._base_url}/chat/completions"
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": kwargs.get("temperature", 0.2),
+        }
+        if kwargs.get("max_tokens") is not None:
+            payload["max_tokens"] = kwargs["max_tokens"]
+        if "response_format" in kwargs:
+            payload["response_format"] = kwargs["response_format"]
+        return _http_post_json(url, headers, payload, self._timeout_s)
 
-        payload: dict[str, Any] = {"model": model, "messages": messages}
-        if not model.lower().startswith("gpt-5"):
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if response_format is not None:
-            payload["response_format"] = response_format
 
-        return _http_post_json(url=url, headers=headers, payload=payload, timeout_s=self._timeout_s)
+class HttpTargetClient:
+    def __init__(self, url: str, headers: dict[str, str] | None = None, timeout_s: int = 60):
+        self._url, self._headers, self._timeout_s = url, headers or {"Content-Type": "application/json"}, timeout_s
+
+    def chat_completions_create(self, *, model: str, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
+        payload = {"model": model, "messages": messages}
+        raw_response = _http_post_json(self._url, self._headers, payload, self._timeout_s)
+        content = _find_text_value(raw_response) or str(raw_response)
+        return _wrap_text_response(content, raw=raw_response)
 
 
 class AnthropicClient:
-    def __init__(
-        self,
-        base_url: str,
-        api_key: str,
-        timeout_s: int = 60,
-        anthropic_version: str = "2023-06-01",
-    ):
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout_s = timeout_s
-        self._anthropic_version = anthropic_version
+    def __init__(self, base_url: str, api_key: str, timeout_s: int = 60):
+        self._base_url, self._api_key, self._timeout_s = base_url.rstrip("/"), api_key, timeout_s
 
-    def chat_completions_create(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, str]],
-        temperature: float = 0.2,
-        max_tokens: int | None = 800,
-        response_format: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del response_format  # Intentionally accepted for OpenAI-compat call sites.
-
+    def chat_completions_create(self, *, model: str, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
         system_prompt, raw_messages = _split_system_messages(messages)
-        anthropic_messages: list[dict[str, Any]] = []
-        for role, content in raw_messages:
-            if role not in {"user", "assistant"}:
-                continue
-            anthropic_messages.append({"role": role, "content": content})
-
-        payload: dict[str, Any] = {
+        payload = {
             "model": model,
-            "messages": anthropic_messages,
-            "max_tokens": int(max_tokens or 800),
-            "temperature": temperature,
+            "messages": [{"role": role, "content": content} for role, content in raw_messages],
+            "max_tokens": kwargs.get("max_tokens", 1024),
+            "temperature": kwargs.get("temperature", 0.2),
         }
         if system_prompt:
             payload["system"] = system_prompt
-
-        url = f"{self._base_url}/messages"
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            "x-api-key": self._api_key,
-            "anthropic-version": self._anthropic_version,
-        }
-        resp_data = _http_post_json(url=url, headers=headers, payload=payload, timeout_s=self._timeout_s)
-
-        content_blocks = resp_data.get("content")
-        text = ""
-        if isinstance(content_blocks, list):
-            text = _extract_text_parts(
-                [block for block in content_blocks if isinstance(block, dict) and block.get("type") == "text"]
-            )
-        if not text and isinstance(resp_data.get("completion"), str):
-            text = resp_data["completion"].strip()
-
-        return {"choices": [{"message": {"content": text}}], "raw": resp_data}
+        headers = {"Content-Type": "application/json", "x-api-key": self._api_key, "anthropic-version": "2023-06-01"}
+        raw_response = _http_post_json(f"{self._base_url}/messages", headers, payload, self._timeout_s)
+        text_blocks = [block for block in raw_response.get("content", []) if block.get("type") == "text"]
+        text = _join_text_parts(text_blocks)
+        return _wrap_text_response(text, raw=raw_response)
 
 
 class GoogleClient:
     def __init__(self, base_url: str, api_key: str, timeout_s: int = 60):
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout_s = timeout_s
+        self._base_url, self._api_key, self._timeout_s = base_url.rstrip("/"), api_key, timeout_s
 
-    def chat_completions_create(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, str]],
-        temperature: float = 0.2,
-        max_tokens: int | None = 800,
-        response_format: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del response_format  # Intentionally accepted for OpenAI-compat call sites.
-
+    def chat_completions_create(self, *, model: str, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
         system_prompt, raw_messages = _split_system_messages(messages)
-        contents: list[dict[str, Any]] = []
-        for role, content in raw_messages:
-            if role == "assistant":
-                role = "model"
-            if role not in {"user", "model"}:
-                continue
-            contents.append({"role": role, "parts": [{"text": content}]})
-
-        payload: dict[str, Any] = {
-            "contents": contents,
-            "generationConfig": {"temperature": temperature, "maxOutputTokens": int(max_tokens or 800)},
-        }
+        contents = [
+            {"role": "model" if role == "assistant" else "user", "parts": [{"text": content}]}
+            for role, content in raw_messages
+        ]
+        generation_config: dict[str, Any] = {"temperature": kwargs.get("temperature", 0.2)}
+        if kwargs.get("max_tokens") is not None:
+            generation_config["maxOutputTokens"] = kwargs["max_tokens"]
+        response_format = kwargs.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            generation_config["responseMimeType"] = "application/json"
+        payload = {"contents": contents, "generationConfig": generation_config}
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
-
-        qs = urlencode({"key": self._api_key}) if self._api_key else ""
-        url = f"{self._base_url}/models/{model}:generateContent"
-        if qs:
-            url = f"{url}?{qs}"
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        resp_data = _http_post_json(url=url, headers=headers, payload=payload, timeout_s=self._timeout_s)
-
-        # Google response shape: candidates[0].content.parts[].text
-        text = ""
-        candidates = resp_data.get("candidates")
-        if isinstance(candidates, list) and candidates:
-            cand0 = candidates[0] if isinstance(candidates[0], dict) else {}
-            content = cand0.get("content") if isinstance(cand0, dict) else None
-            if isinstance(content, dict):
-                text = _extract_text_parts(content.get("parts"))
-
-        return {"choices": [{"message": {"content": text}}], "raw": resp_data}
+        raw_response = _http_post_json(
+            f"{self._base_url}/models/{model}:generateContent?key={self._api_key}",
+            {"Content-Type": "application/json"},
+            payload,
+            self._timeout_s,
+        )
+        text = _join_text_parts(raw_response.get("candidates", [{}])[0].get("content", {}).get("parts", []))
+        return _wrap_text_response(text, raw=raw_response)
 
 
-def extract_message_content(resp: dict[str, Any]) -> str:
-    choices = resp.get("choices")
-    if not isinstance(choices, list) or not choices:
+def extract_message_content(response: dict[str, Any]) -> str:
+    choices = response.get("choices", [])
+    if not choices:
         return ""
-    choice0 = choices[0] if isinstance(choices[0], dict) else {}
-    msg = choice0.get("message") if isinstance(choice0, dict) else None
-    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-        return msg["content"]
-    if isinstance(choice0.get("text"), str):
-        return choice0["text"]
-    return ""
+    msg = choices[0].get("message", {})
+    return msg.get("content", "") or choices[0].get("text", "")
+
+
+def _find_text_value(payload: object) -> str | None:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("content", "text", "message", "response", "output"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        return value.get("content", value) if isinstance(value, dict) else str(value)
+    for value in payload.values():
+        found = _find_text_value(value)
+        if found:
+            return found
+    return None
 
 
 def parse_json_from_text(text: str) -> Any | None:
     text = text.strip()
-    if not text:
-        return None
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try fenced code blocks: ```json ... ```
-    fence = "```"
-    if fence in text:
-        parts = text.split(fence)
-        for i in range(1, len(parts), 2):
-            candidate = parts[i].strip()
-            if candidate.lower().startswith("json"):
-                candidate = candidate[4:].strip()
-            if candidate.startswith("{") and candidate.endswith("}"):
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    continue
+    fence_marker = "```"
+    if fence_marker in text:
+        parts = text.split(fence_marker)
+        for block in parts[1::2]:
+            candidate = block.split("\n", 1)[1].strip() if "\n" in block else block.strip()
+            if not candidate:
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
 
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    escape = False
-    end: int | None = None
-    for idx in range(start, len(text)):
-        ch = text[idx]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-
-        if ch == '"':
-            in_str = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = idx + 1
-                break
-            continue
-
-    if end is None or depth != 0:
-        return None
-    candidate = text[start:end].strip()
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
-def chat_json(
-    client: ChatClient,
-    *,
-    model: str,
-    messages: list[dict[str, str]],
-    temperature: float = 0.2,
-    max_tokens: int | None = 800,
-) -> dict[str, Any]:
-    last_request_error: Exception | None = None
-    last_content: str | None = None
-    for response_format in ({"type": "json_object"}, None):
-        try:
-            resp = client.chat_completions_create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format=response_format,
-            )
-        except Exception as e:
-            last_request_error = e
-            continue
-
-        content = extract_message_content(resp)
-        last_content = content
-        data = parse_json_from_text(content)
-        if isinstance(data, dict):
-            return data
-
-    if last_content is not None:
-        preview = last_content.strip().replace("\n", " ")[:500]
-        raise RuntimeError(f"Model did not return valid JSON. Content preview: {preview}")
-    if last_request_error is not None:
-        raise last_request_error
-    raise RuntimeError("Request failed without a response body.")
+def chat_json(client: ChatClient, *, model: str, messages: list[dict[str, str]], temperature: float = 0.2) -> dict[str, Any]:
+    response = client.chat_completions_create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        response_format={"type": "json_object"},
+    )
+    content = extract_message_content(response)
+    data = parse_json_from_text(content)
+    if isinstance(data, dict):
+        return data
+    raise RuntimeError(f"Failed to parse JSON: {content[:100]}")
